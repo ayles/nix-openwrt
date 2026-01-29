@@ -41,6 +41,28 @@
           pkgs.callPackage ./lib/openwrt.nix openwrtConfig;
       };
 
+      # Example builds for BananaPi R4
+      packages = forAllSystems (
+        system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+          openwrt = self.lib.mkDevice {
+            inherit pkgs;
+            device = "bananapi-r4";
+          };
+          downloadsHash = "sha256-sXe9qSqLo4QI7p800wzn51On/1CGH/mJ9hyi3IMbIx0=";
+        in
+        {
+          downloads = openwrt.downloads { inherit downloadsHash; };
+          imagebuilder = openwrt.imagebuilder { inherit downloadsHash; };
+          default = openwrt.mkImage {
+            profile = deviceConfigs.bananapi-r4.profile;
+            inherit downloadsHash;
+            packages = [ "luci" "luci-ssl" ];
+          };
+        }
+      );
+
       # Apps for managing device configurations
       apps = forAllSystems (
         system:
