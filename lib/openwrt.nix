@@ -2,14 +2,11 @@
 #
 # Usage:
 #   openwrt = pkgs.callPackage ./lib/openwrt.nix {
-#     openwrtVersion = "25.12.0-rc2";
-#     openwrtRev = "4dd2e6ec5b81becd32dc25d85d977510d363a419";
-#     openwrtHash = "sha256-...";
+#     src = fetchFromGitHub { owner = "openwrt"; repo = "openwrt"; ... };
+#     config = fetchurl { url = "https://downloads.openwrt.org/..."; ... };
 #     target = "mediatek";
 #     subtarget = "filogic";
 #     profile = "bananapi_bpi-r4";  # optional: filter to single device
-#     configHash = "sha256-...";  # hash of official config.buildinfo
-#     feeds = [ { name = "packages"; owner = "openwrt"; ... } ];
 #   };
 #
 #   openwrt.mkImage {
@@ -22,7 +19,7 @@
 #   }
 #
 # Architecture:
-# 1. Feeds pre-fetched via fetchFromGitHub (reliable, cached)
+# 1. Feeds cloned from feeds.conf.default inside the FOD (has network)
 # 2. Package sources downloaded via FOD (deterministic hash)
 # 3. Full OpenWrt build produces ImageBuilder
 # 4. mkImage uses ImageBuilder for final firmware
@@ -55,50 +52,32 @@
   rsync,
   zlib,
   python3,
-  fetchFromGitHub,
-  fetchurl,
-  # OpenWrt configuration
-  openwrtVersion,
-  openwrtRev,
-  openwrtHash,
+  # OpenWrt source tree (e.g. fetchFromGitHub result)
+  src,
+  # Build configuration (e.g. fetchurl of config.buildinfo, or a local path)
+  config,
   target,
   subtarget,
-  # Hash of the official config.buildinfo (fetched from downloads.openwrt.org)
-  configHash,
-  feeds,
   # Optional: build only for this device profile (e.g. "bananapi_bpi-r4").
   # When set, disables all other device profiles in the config.
   # Reduces build time by skipping ATF/u-boot for other boards.
   # Vermagic is unaffected since it depends only on kernel config.
   profile ? null,
   # Optional: override the build config entirely (path or derivation).
-  # When set, configUrl/configHash are ignored.
+  # When set, config is ignored.
   buildConfig ? null,
 }:
 
 let
-  version = openwrtVersion;
+  version = src.rev;
 
-  # Fetch OpenWrt source
-  openwrtSrc = fetchFromGitHub {
-    owner = "openwrt";
-    repo = "openwrt";
-    rev = openwrtRev;
-    hash = openwrtHash;
-  };
-
-  # Build configuration: use override or fetch official + optionally filter device
-  officialConfig = fetchurl {
-    url = "https://downloads.openwrt.org/releases/${version}/targets/${target}/${subtarget}/config.buildinfo";
-    hash = configHash;
-  };
-
+  # Build configuration: use override or filter official config by device
   filteredConfig =
     if profile == null then
-      officialConfig
+      config
     else
       runCommand "openwrt-config-${profile}" { } ''
-        cp ${officialConfig} $out
+        cp ${config} $out
         sed -i '/^CONFIG_TARGET_DEVICE_PACKAGES_/!s/^CONFIG_TARGET_DEVICE_\(.*\)=y$/# CONFIG_TARGET_DEVICE_\1 is not set/' $out
         sed -i 's/^# CONFIG_TARGET_DEVICE_\(.*_DEVICE_${profile}\) is not set$/CONFIG_TARGET_DEVICE_\1=y/' $out
         sed -i '/^CONFIG_TARGET_DEVICE_PACKAGES_.*_DEVICE_${profile}="/!{/^CONFIG_TARGET_DEVICE_PACKAGES_/d}' $out
@@ -173,24 +152,18 @@ let
       args = [ old.builder ] ++ old.args;
     });
 
-  # Pre-fetch all feeds
-  fetchedFeeds = map (feed: {
-    inherit (feed) name;
-    src = fetchFromGitHub {
-      owner = feed.owner;
-      repo = feed.repo;
-      rev = feed.rev;
-      hash = feed.hash;
-    };
-  }) feeds;
-
-  # Common setup: copy pre-fetched feeds
-  setupFeeds = ''
-    mkdir -p feeds
-    ${lib.concatMapStringsSep "\n" (
-      feed: "cp -r ${feed.src} feeds/${feed.name} && chmod -R u+w feeds/${feed.name}"
-    ) fetchedFeeds}
+  # Clone feeds from feeds.conf.default (requires network — use in FOD only)
+  setupFeedsClone = ''
+    ./scripts/feeds update -a
+    find feeds -name .git -type d -exec rm -rf {} +
   '';
+
+  # Copy pre-cloned feeds from FOD output (offline — use in imagebuilder)
+  setupFeedsCopy =
+    downloads: ''
+      cp -r ${downloads}/feeds .
+      chmod -R u+w feeds
+    '';
 
   # Setup config: index feeds and apply build configuration
   setupConfig = ''
@@ -213,7 +186,7 @@ let
     extraFiles:
     lib.concatStringsSep "\n" (lib.mapAttrsToList (dest: src: "cp ${src} ${dest}") extraFiles);
 
-  # Build downloads FOD
+  # Build downloads FOD (has network access)
   mkDownloads =
     {
       downloadsHash,
@@ -222,8 +195,7 @@ let
     runInFHS (
       stdenv.mkDerivation {
         pname = "openwrt-downloads-${target}-${subtarget}";
-        inherit version;
-        src = openwrtSrc;
+        inherit version src;
 
         outputHash = downloadsHash;
         outputHashMode = "recursive";
@@ -239,7 +211,7 @@ let
         hardeningDisable = [ "all" ];
 
         postPatch = ''
-          ${setupFeeds}
+          ${setupFeedsClone}
           ${copyExtraFiles extraFiles}
         '';
 
@@ -286,11 +258,12 @@ let
         installPhase = ''
           mkdir -p $out
           cp -r dl $out/
+          cp -r feeds $out/
         '';
       }
     );
 
-  # Build ImageBuilder
+  # Build ImageBuilder (offline — uses feeds and downloads from FOD)
   mkImageBuilder =
     {
       downloads,
@@ -299,8 +272,7 @@ let
     runInFHS (
       stdenv.mkDerivation {
         pname = "openwrt-imagebuilder-${target}-${subtarget}";
-        inherit version;
-        src = openwrtSrc;
+        inherit version src;
         nativeBuildInputs = buildDeps;
         dontConfigure = true;
         dontFixup = true;
@@ -309,7 +281,7 @@ let
         postPatch = ''
           cp -r ${downloads}/dl .
           chmod -R u+w dl
-          ${setupFeeds}
+          ${setupFeedsCopy downloads}
           ${copyExtraFiles extraFiles}
         '';
 
