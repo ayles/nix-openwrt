@@ -7,13 +7,12 @@
 #     openwrtHash = "sha256-...";
 #     target = "mediatek";
 #     subtarget = "filogic";
-#     configUrl = "https://downloads.openwrt.org/releases/...";
-#     configHash = "sha256-...";
+#     profile = "bananapi_bpi-r4";  # optional: filter to single device
+#     configHash = "sha256-...";  # hash of official config.buildinfo
 #     feeds = [ { name = "packages"; owner = "openwrt"; ... } ];
 #   };
 #
 #   openwrt.mkImage {
-#     profile = "bananapi_bpi-r4";
 #     packages = [ "luci" "htop" ];
 #     files = ./files;
 #     extraFiles = {
@@ -31,6 +30,7 @@
 {
   lib,
   buildFHSEnv,
+  runCommand,
   stdenv,
   writeScript,
   bash,
@@ -55,7 +55,6 @@
   rsync,
   zlib,
   python3,
-  llvmPackages,
   fetchFromGitHub,
   fetchurl,
   # OpenWrt configuration
@@ -64,9 +63,17 @@
   openwrtHash,
   target,
   subtarget,
-  configUrl,
+  # Hash of the official config.buildinfo (fetched from downloads.openwrt.org)
   configHash,
   feeds,
+  # Optional: build only for this device profile (e.g. "bananapi_bpi-r4").
+  # When set, disables all other device profiles in the config.
+  # Reduces build time by skipping ATF/u-boot for other boards.
+  # Vermagic is unaffected since it depends only on kernel config.
+  profile ? null,
+  # Optional: override the build config entirely (path or derivation).
+  # When set, configUrl/configHash are ignored.
+  buildConfig ? null,
 }:
 
 let
@@ -80,11 +87,24 @@ let
     hash = openwrtHash;
   };
 
-  # Fetch config.buildinfo for vermagic compatibility
-  buildConfig = fetchurl {
-    url = configUrl;
+  # Build configuration: use override or fetch official + optionally filter device
+  officialConfig = fetchurl {
+    url = "https://downloads.openwrt.org/releases/${version}/targets/${target}/${subtarget}/config.buildinfo";
     hash = configHash;
   };
+
+  filteredConfig =
+    if profile == null then
+      officialConfig
+    else
+      runCommand "openwrt-config-${profile}" { } ''
+        cp ${officialConfig} $out
+        sed -i '/^CONFIG_TARGET_DEVICE_PACKAGES_/!s/^CONFIG_TARGET_DEVICE_\(.*\)=y$/# CONFIG_TARGET_DEVICE_\1 is not set/' $out
+        sed -i 's/^# CONFIG_TARGET_DEVICE_\(.*_DEVICE_${profile}\) is not set$/CONFIG_TARGET_DEVICE_\1=y/' $out
+        sed -i '/^CONFIG_TARGET_DEVICE_PACKAGES_.*_DEVICE_${profile}="/!{/^CONFIG_TARGET_DEVICE_PACKAGES_/d}' $out
+      '';
+
+  effectiveConfig = if buildConfig != null then buildConfig else filteredConfig;
 
   # Fix for https://github.com/NixOS/nixpkgs/issues/21751
   # Unwrapped GCC leaks architecture-prefixed binaries (e.g., aarch64-unknown-linux-gnu-gcc)
@@ -111,7 +131,6 @@ let
   buildDeps = [
     gccFixWrapper # Must be before stdenv.cc to override broken binaries
     stdenv.cc
-    llvmPackages.stdenv.cc
     bash
     bison
     cacert
@@ -173,14 +192,20 @@ let
     ) fetchedFeeds}
   '';
 
-  # Common setup: configure feeds and build config
-  setupBuild = ''
+  # Setup config: index feeds and apply build configuration
+  setupConfig = ''
     ./scripts/feeds update -a -i
     ./scripts/feeds install -a
-    cp ${buildConfig} .config
+    cp ${effectiveConfig} .config
     chmod u+w .config
-    echo "CONFIG_BPF_TOOLCHAIN_HOST=y" >> .config
     make defconfig
+  '';
+
+  # Nix's binutils-wrapper exports AS=as, AR=ar, LD=ld, etc.
+  # TF-A's toolchain.mk uses these if defined, bypassing CROSS_COMPILE derivation,
+  # which causes the host assembler to be used instead of the cross-assembler.
+  unsetToolVars = ''
+    unset AS AR LD NM OBJCOPY OBJDUMP RANLIB READELF SIZE STRIP STRINGS
   '';
 
   # Copy extra files into source tree: { "path/in/tree" = ./local/file; }
@@ -211,6 +236,7 @@ let
         nativeBuildInputs = buildDeps;
         dontConfigure = true;
         dontFixup = true;
+        hardeningDisable = [ "all" ];
 
         postPatch = ''
           ${setupFeeds}
@@ -218,44 +244,43 @@ let
         '';
 
         buildPhase = ''
-          ${setupBuild}
+          ${unsetToolVars}
+          ${setupConfig}
 
-          # Download all sources needed for the build
-          # The .config file determines what will be built, and thus what needs to be downloaded
+          # Phase 1: download tools, toolchain, and selected packages via
+          # the toplevel download target (also compiles flock/zstd/mkhash).
+          make download -j''${NIX_BUILD_CORES:-1} V=s
 
-          # 1. Download toolchain (sequential to avoid races)
-          echo "==> Downloading toolchain sources..."
-          if ! make toolchain/download -j1 V=s; then
-            echo "ERROR: Failed to download toolchain sources"
-            exit 1
-          fi
+          # Phase 1b: download ALL tool sources (not just tools-y).
+          # The toplevel `make download` only fetches tools in builddirs-default
+          # (= tools-y). Conditional tools like liblzo (compile dep of lzop) are
+          # skipped. CHECK_ALL=1 on tools/download specifically expands just the
+          # tools list without affecting package selection.
+          make tools/download CHECK_ALL=1 -j''${NIX_BUILD_CORES:-1} V=s
 
-          # 2. Download tools (parallel downloads)
-          echo "==> Downloading build tool sources..."
-          if ! make tools/download -j''${NIX_BUILD_CORES:-1} V=s; then
-            echo "ERROR: Failed to download tool sources"
-            exit 1
-          fi
+          # Phase 2: download transitive compile-time dependencies.
+          # The toplevel `make download` only fetches sources for selected
+          # packages (CONFIG_PACKAGE_*=y/m). But the full build also needs
+          # sources for compile-time dependencies (e.g. ncurses is needed
+          # to build util-linux). Use Make to resolve the conditional
+          # dependency graph from .packagedeps (respecting $(if ...) guards),
+          # then BFS in Python to compute the transitive closure.
+          #
+          # Note: `make package/download CHECK_ALL=1` would be simpler but
+          # downloads ALL packages including unrelated targets, hitting
+          # non-deterministic git archives (zstd -T0) that break FOD hashing.
 
-          # 3. Download all package sources (parallel downloads)
-          # This includes both target and host packages based on what's enabled in .config
-          echo "==> Downloading package sources..."
-          if ! make download -j''${NIX_BUILD_CORES:-1} V=s; then
-            echo "ERROR: Failed to download package sources"
-            exit 1
-          fi
+          # Dump resolved compile deps via Make (evaluates $(if CONFIG_X,...) against .config)
+          make -f ${./dump-deps.mk} __dump 2>/dev/null > /tmp/resolved_deps.txt
 
-          # 4. Verify all required sources are present
-          echo "==> Verifying downloads..."
-          if ! make check V=s; then
-            echo "WARNING: Some downloads may be missing or have incorrect checksums"
-            echo "Continuing anyway - build will fail later if truly needed"
-          fi
+          # Compute transitive closure and find extra packages to download
+          python3 ${./resolve-extra-downloads.py} /tmp/resolved_deps.txt tmp/.packageinfo \
+            | sort -u > /tmp/extra_downloads.txt
 
-          echo "==> Download phase complete"
-          echo "Downloaded files:"
-          du -sh dl/ || true
-          find dl/ -type f | wc -l || true
+          echo "=== Downloading $(wc -l < /tmp/extra_downloads.txt) extra compile-dep packages ==="
+          while read -r srcdir; do
+            make "package/$srcdir/download" V=s
+          done < /tmp/extra_downloads.txt
         '';
 
         installPhase = ''
@@ -289,26 +314,14 @@ let
         '';
 
         buildPhase = ''
-          ${setupBuild}
+          ${unsetToolVars}
+          ${setupConfig}
           make -j''${NIX_BUILD_CORES:-1} V=s
         '';
 
         installPhase = ''
           mkdir -p $out
-
-          # Copy ImageBuilder tarball
-          if ! cp -v bin/targets/${target}/${subtarget}/openwrt-imagebuilder-*.tar.* $out/ 2>/dev/null; then
-            echo "ERROR: ImageBuilder tarball not found!"
-            echo "Expected: bin/targets/${target}/${subtarget}/openwrt-imagebuilder-*.tar.*"
-            echo "Contents of bin/targets/${target}/${subtarget}/:"
-            ls -la bin/targets/${target}/${subtarget}/ || true
-            exit 1
-          fi
-
-          # Optional: SDK and metadata (may not always be built)
-          cp -v bin/targets/${target}/${subtarget}/openwrt-sdk-*.tar.* $out/ 2>/dev/null || true
-          cp -v bin/targets/${target}/${subtarget}/sha256sums $out/ 2>/dev/null || true
-          cp -v bin/targets/${target}/${subtarget}/profiles.json $out/ 2>/dev/null || true
+          cp -v bin/targets/${target}/${subtarget}/* $out/
         '';
       }
     );
@@ -348,10 +361,12 @@ let
         installPhase = ''
           mkdir -p $out
 
-          # Copy all firmware files (different targets use different extensions)
-          cp -v bin/targets/${target}/${subtarget}/*.{itb,bin,fip} $out/ 2>/dev/null || true
-          cp -v bin/targets/${target}/${subtarget}/*.img.gz $out/ 2>/dev/null || true
-          cp -v bin/targets/${target}/${subtarget}/sha256sums $out/ 2>/dev/null || true
+          # Copy firmware files — not all extensions exist for every target,
+          # so use find instead of globs that would fail with set -e.
+          find bin/targets/${target}/${subtarget} -maxdepth 1 \
+            \( -name '*.itb' -o -name '*.bin' -o -name '*.fip' \
+               -o -name '*.img.gz' -o -name 'sha256sums' \) \
+            -exec cp -v {} $out/ \;
 
           # Create convenience symlinks for common upgrade paths
           # Note: These patterns may vary between OpenWrt versions and targets
@@ -370,7 +385,6 @@ in
   # High-level: build complete image in one call
   mkImage =
     {
-      profile,
       packages ? [ ],
       files ? null,
       extraFiles ? { },
@@ -380,15 +394,16 @@ in
     let
       downloads = mkDownloads { inherit downloadsHash extraFiles; };
       imagebuilder = mkImageBuilder { inherit downloads extraFiles; };
+      imageProfile = assert profile != null; profile;
     in
     mkImageFromBuilder {
       inherit
         imagebuilder
-        profile
         files
         packages
         extraMakeFlags
         ;
+      profile = imageProfile;
     };
 
   # Low-level: expose individual stages for debugging/incremental builds
