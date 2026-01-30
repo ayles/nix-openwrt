@@ -293,7 +293,7 @@ let
 
         installPhase = ''
           mkdir -p $out
-          cp -v bin/targets/${target}/${subtarget}/* $out/
+          find bin/targets/${target}/${subtarget} -maxdepth 1 -type f -exec cp -v {} $out/ \;
         '';
       }
     );
