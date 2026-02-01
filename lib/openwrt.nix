@@ -293,7 +293,7 @@ let
 
         installPhase = ''
           mkdir -p $out
-          find bin/targets/${target}/${subtarget} -maxdepth 1 -type f -exec cp -v {} $out/ \;
+          cp -r bin $out/bin
         '';
       }
     );
@@ -317,13 +317,22 @@ let
         dontFixup = true;
 
         unpackPhase = ''
-          tar xf $src/openwrt-imagebuilder-*.tar.*
+          tar xf $src/bin/targets/${target}/${subtarget}/openwrt-imagebuilder-*.tar.*
           cd openwrt-imagebuilder-*
           sourceRoot=$(pwd)
         '';
 
         buildPhase = ''
-          ${lib.optionalString (files != null) "cp -rv ${files}/* files/ || mkdir -p files"}
+          # Copy all compiled packages into the imagebuilder's local packages dir.
+          # package_index will re-index and re-sign them with the imagebuilder's
+          # own keys, so no key copying is needed.
+          find $src/bin/targets/${target}/${subtarget}/packages $src/bin/packages \
+            -name '*.apk' -exec cp -n {} packages/ \;
+
+          ${lib.optionalString (files != null) ''
+            mkdir -p files
+            cp -rv ${files}/* files/
+          ''}
           make image PROFILE='${profile}' \
             PACKAGES='${lib.concatStringsSep " " packages}' \
             ${lib.optionalString (files != null) "FILES=files/"} \
