@@ -280,6 +280,7 @@ let
         mkdir -p $out
         cp -r dl $out/
         cp -r feeds $out/
+        find $out/feeds -regex '.*/\..*-[0-9]+$' -delete
       '';
     }
   );
