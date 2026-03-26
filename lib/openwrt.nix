@@ -225,14 +225,14 @@ let
       modcache=$(realpath dl/go-mod-cache)
       for src in $go_sources; do
         [ -f "dl/$src" ] || continue
-        d=$(mktemp -d)
-        tar xf "dl/$src" -C "$d"
-        gomod=$(find "$d" -name go.mod -type f | head -1)
+        gomod=$(tar tf "dl/$src" | grep '/go\.mod$' | sort | head -1)
         if [ -n "$gomod" ]; then
+          d=$(mktemp -d)
+          tar xf "dl/$src" -C "$d"
           echo "Fetching Go modules for $src"
-          (cd "$(dirname "$gomod")" && GOMODCACHE="$modcache" GOFLAGS=-modcacherw go mod download)
+          (cd "$d/$(dirname "$gomod")" && GOMODCACHE="$modcache" GOFLAGS=-modcacherw go mod download)
+          rm -rf "$d"
         fi
-        rm -rf "$d"
       done
     fi
   '';
