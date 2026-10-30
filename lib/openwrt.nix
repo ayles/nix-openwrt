@@ -304,7 +304,8 @@ let
       buildPhase = ''
         ${unsetToolVars}
         ${setupConfig}
-        make -j''${NIX_BUILD_CORES:-1} V=s
+        # CONFIG_IB also builds kernels for unselected devices unless constrained.
+        make -j''${NIX_BUILD_CORES:-1} V=s ${lib.optionalString (profile != null) "TARGET_DEVICES=${profile}"}
       '';
 
       installPhase = ''
