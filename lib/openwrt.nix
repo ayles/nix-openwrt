@@ -426,7 +426,7 @@ let
         cd openwrt-sdk-*
 
         ${lib.concatMapStringsSep "\n" (patch: ''
-          patch -p1 --batch --fuzz=0 --no-backup-if-mismatch -i ${lib.escapeShellArg (toString patch)}
+          patch -p1 --batch --fuzz=0 --no-backup-if-mismatch -i ${lib.escapeShellArg "${patch}"}
         '') patches}
 
         # SDK doesn't ship feed sources — copy from downloads FOD.
