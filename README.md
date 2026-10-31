@@ -103,6 +103,11 @@ image = openwrt.mkImage {
 };
 ```
 
+SDK builds disable OpenWrt's `AUTOREBUILD` and `AUTOREMOVE` options so separate
+package targets can reuse their shared dependencies. Each Nix build already
+starts from a fresh SDK with fixed inputs, and Nix tracks source changes.
+Package selection and dependency resolution still use OpenWrt's normal rules.
+
 ## Downloads hash
 
 The `downloadsHash` is a fixed-output hash for the download phase. To compute it:

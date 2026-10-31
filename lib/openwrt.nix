@@ -406,7 +406,8 @@ let
 
       # Compile per-package using Make's native dependency resolution.
       # Map package names to Make targets (handles variants like dnsmasq-full → dnsmasq).
-      # Single make invocation lets Make parallelize independent packages.
+      # OpenWrt dispatches each top-level target separately; retain build state
+      # below so their shared dependencies are only compiled and packaged once.
       compilePackages = ''
         targets=$(python3 ${./openwrt_packages.py} make-targets tmp/.packageinfo \
           ${lib.concatStringsSep " " packages})
@@ -454,6 +455,10 @@ let
         echo '# CONFIG_ALL is not set' > .config
         echo '# CONFIG_ALL_KMODS is not set' >> .config
         echo '# CONFIG_ALL_NONSHARED is not set' >> .config
+        # Each Nix build starts with a fresh SDK and fixed inputs. Keep shared
+        # dependencies between targets; Nix handles source-change invalidation.
+        echo '# CONFIG_AUTOREBUILD is not set' >> .config
+        echo '# CONFIG_AUTOREMOVE is not set' >> .config
         ${enablePackages}
         cat ${sdkExtraConfigFile} >> .config
         make defconfig
