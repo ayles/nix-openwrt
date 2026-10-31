@@ -387,6 +387,7 @@ let
       packages,
       downloadsHash,
       feed ? null,
+      patches ? [ ],
       extraBuildInputs ? [ ],
       extraConfig ? "",
     }:
@@ -423,6 +424,10 @@ let
       sdkSetup = ''
         tar xf ${fullBuild}/bin/targets/${target}/${subtarget}/openwrt-sdk-*.tar.*
         cd openwrt-sdk-*
+
+        ${lib.concatMapStringsSep "\n" (patch: ''
+          patch -p1 --batch --fuzz=0 --no-backup-if-mismatch -i ${lib.escapeShellArg (toString patch)}
+        '') patches}
 
         # SDK doesn't ship feed sources — copy from downloads FOD.
         # feeds/base is a symlink to ../package (the base package tree),

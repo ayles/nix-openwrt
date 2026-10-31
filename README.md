@@ -108,6 +108,10 @@ package targets can reuse their shared dependencies. Each Nix build already
 starts from a fresh SDK with fixed inputs, and Nix tracks source changes.
 Package selection and dependency resolution still use OpenWrt's normal rules.
 
+`mkPackages` also accepts `patches = [ ./sdk-build-fix.patch ];`. These unified
+diffs are applied with `-p1` to the unpacked SDK before package setup. This lets
+you backport SDK build fixes without invalidating the cached full system build.
+
 ## Downloads hash
 
 The `downloadsHash` is a fixed-output hash for the download phase. To compute it:
